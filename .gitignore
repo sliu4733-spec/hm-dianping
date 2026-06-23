@@ -31,3 +31,14 @@ build/
 
 ### VS Code ###
 .vscode/
+
+# Runtime crash logs
+hs_err_pid*.log
+replay_pid*.log
+
+# Local pressure-test tokens
+tokens.txt
+D:/tokens.txt
+
+# Logs
+*.log

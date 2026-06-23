@@ -67,6 +67,11 @@ public class BlogComments implements Serializable {
     private Boolean status;
 
     /**
+     * 是否置顶，0：否，1：是
+     */
+    private Boolean isTop;
+
+    /**
      * 创建时间
      */
     private LocalDateTime createTime;

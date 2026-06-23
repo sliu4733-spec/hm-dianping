@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>附近店铺</title>
+  <link rel="stylesheet" href="./css/element.css">
+  <link rel="stylesheet" href="./css/common.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #app { margin: 0; width: 100%; height: 100%; background: #eaf0f8; }
+    .map-page { position: relative; width: 100%; max-width: 390px; height: 100vh; margin: 0 auto; background: #fff; overflow: hidden; }
+    .map-header { position: absolute; top: 0; left: 0; right: 0; z-index: 1000; height: 44px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px; color: #fff; background: #ff6633; box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+    .back-btn { border: 0; height: 36px; display: flex; align-items: center; gap: 3px; color: #fff; background: transparent; font-size: 14px; cursor: pointer; }
+    .back-icon { font-size: 24px; line-height: 1; }
+    .title { position: absolute; left: 90px; right: 90px; text-align: center; font-size: 16px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .shop-count { max-width: 92px; font-size: 12px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .9; }
+    #map { width: 100%; height: 100%; background: #f8f8f8; }
+    .leaflet-control-zoom { margin-top: 56px !important; }
+    .shop-popup { min-width: 168px; line-height: 1.6; }
+    .shop-popup strong { display: block; margin-bottom: 2px; color: #222; }
+    .popup-actions { display: flex; gap: 8px; margin-top: 8px; }
+    .navi-btn, .detail-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 76px; height: 28px; padding: 0 10px; border-radius: 14px; text-decoration: none; font-size: 13px; }
+    .navi-btn { color: #fff !important; background: #ff6633; }
+    .detail-btn { color: #ff6633 !important; background: #fff0ea; }
+    .loading-mask, .error-mask { position: absolute; inset: 44px 0 0 0; z-index: 900; display: flex; align-items: center; justify-content: center; padding: 24px; color: #666; background: rgba(255,255,255,.82); font-size: 14px; text-align: center; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="map-page">
+    <div class="map-header">
+      <button class="back-btn" @click="goBack" type="button"><span class="back-icon">‹</span><span>返回</span></button>
+      <span class="title">{{ locationText }}</span>
+      <span class="shop-count">{{ shops.length }}家附近</span>
+    </div>
+    <div id="map"></div>
+    <div class="loading-mask" v-if="loading">正在定位附近店铺...</div>
+    <div class="error-mask" v-if="errorText">{{ errorText }}</div>
+  </div>
+</div>
+
+<script src="./js/vue.js"></script>
+<script src="./js/axios.min.js"></script>
+<script src="./js/common.js?v=20260614fix2"></script>
+<script src="./js/location.js?v=20260614fix2"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const DEFAULT_LAT = 30.2741;
+  const DEFAULT_LNG = 120.1551;
+  let map;
+  let userMarker;
+  let selectedMarker;
+  let shopLayer;
+
+  function encodeText(text) { return encodeURIComponent(text || ""); }
+  function amapNavigationUrl(lng, lat, name) {
+    return "https://uri.amap.com/navigation?to=" + lng + "," + lat + "," + encodeText(name || "目的地") + "&mode=car";
+  }
+  function amapMarkerUrl(lng, lat, name) {
+    return "https://uri.amap.com/marker?position=" + lng + "," + lat + "&name=" + encodeText(name || "选中的位置");
+  }
+  function selectedPopupHtml(lat, lng) {
+    return [
+      '<div class="shop-popup">',
+      '<strong>选中的位置</strong>',
+      '<div>可以直接打开高德地图导航</div>',
+      '<div class="popup-actions">',
+      '<a class="navi-btn" target="_blank" href="' + amapNavigationUrl(lng, lat, "选中的位置") + '">高德导航</a>',
+      '<a class="detail-btn" target="_blank" href="' + amapMarkerUrl(lng, lat, "选中的位置") + '">查看位置</a>',
+      '</div>',
+      '</div>'
+    ].join('');
+  }
+  function shopPopupHtml(shop) {
+    const name = shop.name || "店铺";
+    const address = shop.address || "暂无地址";
+    const avgPrice = shop.avgPrice ? "￥" + shop.avgPrice + "/人" : "暂无均价";
+    const distance = shop.distance ? (shop.distance < 1 ? Math.round(shop.distance * 1000) + "m" : shop.distance.toFixed(1) + "km") : "";
+    return [
+      '<div class="shop-popup">',
+      '<strong>' + name + '</strong>',
+      '<div>' + address + '</div>',
+      '<div>' + avgPrice + (distance ? " | " + distance : "") + '</div>',
+      '<div class="popup-actions">',
+      '<a class="navi-btn" target="_blank" href="' + amapNavigationUrl(shop.x, shop.y, name) + '">高德导航</a>',
+      '<a class="detail-btn" href="/shop-detail.html?id=' + shop.id + '">店铺详情</a>',
+      '</div>',
+      '</div>'
+    ].join('');
+  }
+  function initMap(lat, lng) {
+    if (!window.L) {
+      throw new Error("地图资源加载失败，请检查浏览器是否能访问 unpkg.com");
+    }
+    if (map) {
+      map.setView([lat, lng], 14);
+      userMarker.setLatLng([lat, lng]);
+      setTimeout(() => map.invalidateSize(), 100);
+      return;
+    }
+    map = L.map("map", { zoomControl: true }).setView([lat, lng], 14);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+    userMarker = L.marker([lat, lng]).addTo(map)
+      .bindPopup('<div class="shop-popup"><strong>我的位置</strong><div>点击地图可选择要去的位置</div></div>')
+      .openPopup();
+    shopLayer = L.layerGroup().addTo(map);
+    map.on("click", function(e) {
+      const clickLat = e.latlng.lat.toFixed(6);
+      const clickLng = e.latlng.lng.toFixed(6);
+      if (!selectedMarker) {
+        selectedMarker = L.marker(e.latlng).addTo(map);
+      } else {
+        selectedMarker.setLatLng(e.latlng);
+      }
+      selectedMarker.bindPopup(selectedPopupHtml(clickLat, clickLng)).openPopup();
+    });
+    setTimeout(() => map.invalidateSize(), 200);
+    setTimeout(() => map.invalidateSize(), 800);
+  }
+  function renderShops(shops) {
+    if (!map || !shopLayer) return;
+    shopLayer.clearLayers();
+    shops.forEach(function(shop) {
+      if (!shop.x || !shop.y) return;
+      L.marker([shop.y, shop.x]).addTo(shopLayer).bindPopup(shopPopupHtml(shop));
+    });
+  }
+
+  new Vue({
+    el: "#app",
+    data: { locationText: "杭州", shops: [], loading: true, errorText: "" },
+    created() { this.loadMap(); },
+    methods: {
+      goBack() {
+        if (window.history.length > 1) window.history.back();
+        else window.location.href = "/index.html";
+      },
+      async loadMap() {
+        try {
+          const location = await getCurrentLocation(false);
+          const lat = location.lat || DEFAULT_LAT;
+          const lng = location.lng || DEFAULT_LNG;
+          this.locationText = location.city || "杭州";
+          initMap(lat, lng);
+          await this.queryNearbyShops(lat, lng);
+          setTimeout(() => map && map.invalidateSize(), 100);
+        } catch (e) {
+          this.errorText = e.message || "地图加载失败";
+        } finally {
+          this.loading = false;
+        }
+      },
+      async queryNearbyShops(lat, lng) {
+        const typeId = util.getUrlParam("type") || util.getUrlParam("typeId") || 1;
+        const res = await axios.get("/shop/of/type", {
+          params: { typeId: typeId, current: 1, x: lng, y: lat }
+        });
+        this.shops = res.data || [];
+        renderShops(this.shops);
+      }
+    }
+  });
+</script>
+</body>
+</html>

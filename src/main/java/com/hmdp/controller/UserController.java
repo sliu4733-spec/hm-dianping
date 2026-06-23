@@ -52,6 +52,10 @@ public class UserController {
         // 实现登录功能
         return userService.login(loginForm, session);
     }
+    @PostMapping("/refresh")
+    public Result refreshToken(@RequestHeader("refreshToken") String refreshToken) {
+        return userService.refreshToken(refreshToken);
+    }
 
     /**
      * 登出功能
@@ -105,4 +109,5 @@ public class UserController {
     public Result signCount(){
         return userService.signCount();
     }
+
 }

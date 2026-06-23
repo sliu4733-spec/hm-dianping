@@ -12,6 +12,7 @@ import com.hmdp.utils.SystemConstants;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
 import org.springframework.data.geo.GeoResults;
+import org.springframework.data.geo.Metrics;
 import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.domain.geo.GeoReference;
@@ -19,22 +20,23 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
-import static com.hmdp.utils.RedisConstants.*;
+import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
+import static com.hmdp.utils.RedisConstants.CACHE_SHOP_TTL;
+import static com.hmdp.utils.RedisConstants.SHOP_GEO_KEY;
 
-/**
- * <p>
- *  服务实现类
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
- */
 @Service
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
+    private static final double DEFAULT_GEO_RADIUS_KM = 10.0;
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
@@ -44,22 +46,17 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Override
     public Result queryById(Long id) {
-        // 解决缓存穿透
-        Shop shop = cacheClient
-                .queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
-
-        // 互斥锁解决缓存击穿
-        // Shop shop = cacheClient
-        //         .queryWithMutex(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
-
-        // 逻辑过期解决缓存击穿
-        // Shop shop = cacheClient
-        //         .queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, 20L, TimeUnit.SECONDS);
-
+        Shop shop = cacheClient.queryWithPassThrough(
+                CACHE_SHOP_KEY,
+                id,
+                Shop.class,
+                this::getById,
+                CACHE_SHOP_TTL,
+                TimeUnit.MINUTES
+        );
         if (shop == null) {
             return Result.fail("店铺不存在！");
         }
-        // 7.返回
         return Result.ok(shop);
     }
 
@@ -68,67 +65,88 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     public Result update(Shop shop) {
         Long id = shop.getId();
         if (id == null) {
-            return Result.fail("店铺id不能为空");
+            return Result.fail("店铺 id 不能为空");
         }
-        // 1.更新数据库
         updateById(shop);
-        // 2.删除缓存
         stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
         return Result.ok();
     }
 
     @Override
     public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
-        // 1.判断是否需要根据坐标查询
         if (x == null || y == null) {
-            // 不需要坐标查询，按数据库查询
             Page<Shop> page = query()
                     .eq("type_id", typeId)
                     .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
-            // 返回数据
             return Result.ok(page.getRecords());
         }
 
-        // 2.计算分页参数
         int from = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
         int end = current * SystemConstants.DEFAULT_PAGE_SIZE;
 
-        // 3.查询redis、按照距离排序、分页。结果：shopId、distance
         String key = SHOP_GEO_KEY + typeId;
-        GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo() // GEOSEARCH key BYLONLAT x y BYRADIUS 10 WITHDISTANCE
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo()
                 .search(
                         key,
                         GeoReference.fromCoordinate(x, y),
-                        new Distance(5000),
+                        new Distance(DEFAULT_GEO_RADIUS_KM, Metrics.KILOMETERS),
                         RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs().includeDistance().limit(end)
                 );
-        // 4.解析出id
-        if (results == null) {
-            return Result.ok(Collections.emptyList());
+
+        if (results == null || results.getContent().size() <= from) {
+            return queryShopByTypeFromDbWithDistance(typeId, current, x, y);
         }
+
         List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
-        if (list.size() <= from) {
-            // 没有下一页了，结束
-            return Result.ok(Collections.emptyList());
-        }
-        // 4.1.截取 from ~ end的部分
         List<Long> ids = new ArrayList<>(list.size());
         Map<String, Distance> distanceMap = new HashMap<>(list.size());
         list.stream().skip(from).forEach(result -> {
-            // 4.2.获取店铺id
             String shopIdStr = result.getContent().getName();
             ids.add(Long.valueOf(shopIdStr));
-            // 4.3.获取距离
-            Distance distance = result.getDistance();
-            distanceMap.put(shopIdStr, distance);
+            distanceMap.put(shopIdStr, result.getDistance());
         });
-        // 5.根据id查询Shop
+
         String idStr = StrUtil.join(",", ids);
         List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
         for (Shop shop : shops) {
-            shop.setDistance(distanceMap.get(shop.getId().toString()).getValue());
+            Distance distance = distanceMap.get(shop.getId().toString());
+            if (distance != null) {
+                shop.setDistance(distance.getValue());
+            }
         }
-        // 6.返回
         return Result.ok(shops);
+    }
+
+    private Result queryShopByTypeFromDbWithDistance(Integer typeId, Integer current, Double x, Double y) {
+        List<Shop> shops = query()
+                .eq("type_id", typeId)
+                .list();
+        if (shops == null || shops.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+
+        List<Shop> sorted = shops.stream()
+                .filter(shop -> shop.getX() != null && shop.getY() != null)
+                .peek(shop -> shop.setDistance(haversine(y, x, shop.getY(), shop.getX())))
+                .sorted(Comparator.comparing(Shop::getDistance))
+                .collect(Collectors.toList());
+
+        int from = Math.max(0, (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE);
+        if (from >= sorted.size()) {
+            return Result.ok(Collections.emptyList());
+        }
+        int to = Math.min(current * SystemConstants.DEFAULT_PAGE_SIZE, sorted.size());
+        return Result.ok(sorted.subList(from, to));
+    }
+
+    private double haversine(double lat1, double lng1, double lat2, double lng2) {
+        double earthRadiusKm = 6371.0;
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLng = Math.toRadians(lng2 - lng1);
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+                + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
+                * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        return earthRadiusKm * c;
     }
 }

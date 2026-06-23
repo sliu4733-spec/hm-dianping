@@ -1,20 +1,36 @@
 package com.hmdp.controller;
 
+import com.hmdp.dto.Result;
+import com.hmdp.entity.BlogComments;
+import com.hmdp.service.IBlogCommentsService;
+import org.springframework.web.bind.annotation.*;
 
-import org.springframework.web.bind.annotation.RequestMapping;
+import javax.annotation.Resource;
 
-import org.springframework.web.bind.annotation.RestController;
-
-/**
- * <p>
- *  前端控制器
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
- */
 @RestController
 @RequestMapping("/blog-comments")
 public class BlogCommentsController {
 
+    @Resource
+    private IBlogCommentsService blogCommentsService;
+
+    @PostMapping
+    public Result saveComment(@RequestBody BlogComments comment) {
+        return blogCommentsService.saveComment(comment);
+    }
+
+    @GetMapping("/of/{blogId}")
+    public Result queryCommentsByBlogId(@PathVariable("blogId") Long blogId) {
+        return blogCommentsService.queryCommentsByBlogId(blogId);
+    }
+
+    @PutMapping("/like/{id}")
+    public Result likeComment(@PathVariable("id") Long id) {
+        return blogCommentsService.likeComment(id);
+    }
+
+    @PutMapping("/top/{id}")
+    public Result topComment(@PathVariable("id") Long id) {
+        return blogCommentsService.topComment(id);
+    }
 }

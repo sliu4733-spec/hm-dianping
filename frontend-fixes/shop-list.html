@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
+  <title>店铺列表</title>
+  <link rel="stylesheet" href="./css/element.css">
+  <link href="./css/shop-list.css" rel="stylesheet">
+  <link href="./css/main.css" rel="stylesheet">
+  <style>
+    .loading-text { text-align: center; padding: 20px; color: #999; }
+    .empty-text { text-align: center; padding: 30px 12px; color: #999; line-height: 1.7; }
+    .source-tag { display: inline-block; padding: 1px 6px; border-radius: 8px; background: #fff0ea; color: #ff6633; font-size: 10px; margin-left: 4px; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="header">
+    <div class="header-back-btn" @click="goBack"><i class="el-icon-arrow-left"></i></div>
+    <div class="header-title">{{ typeName }}</div>
+    <div class="header-search" @click="searchByName"><i class="el-icon-search"></i></div>
+  </div>
+  <div class="sort-bar">
+    <div class="sort-item">
+      <el-dropdown trigger="click" @command="handleCommand">
+        <span class="el-dropdown-link">{{ typeName }}<i class="el-icon-arrow-down el-icon--right"></i></span>
+        <el-dropdown-menu slot="dropdown">
+          <el-dropdown-item v-for="t in types" :key="t.id" :command="t">{{ t.name }}</el-dropdown-item>
+        </el-dropdown-menu>
+      </el-dropdown>
+    </div>
+    <div class="sort-item" @click="sortAndQuery('distance')">距离</div>
+    <div class="sort-item" @click="sortAndQuery('comments')">人气</div>
+    <div class="sort-item" @click="sortAndQuery('score')">评分</div>
+  </div>
+
+  <div class="shop-list" @scroll="onScroll">
+    <div v-if="loading && shops.length === 0" class="loading-text">正在加载附近店铺...</div>
+    <div v-if="!loading && shops.length === 0" class="empty-text">
+      当前城市附近暂时没有查到该分类店铺。<br>
+      可以换一个城市、扩大范围，或确认高德 Key 是否已配置。
+    </div>
+
+    <div class="shop-box" v-for="s in shops" :key="s.id" @click="toDetail(s)">
+      <div class="shop-img"><img :src="firstImage(s.images)" alt=""></div>
+      <div class="shop-info">
+        <div class="shop-title shop-item">
+          {{ s.name }} <span v-if="s.source" class="source-tag">{{ s.source }}</span>
+        </div>
+        <div class="shop-rate shop-item">
+          <el-rate disabled :value="ratingValue(s)" text-color="#F63" show-score></el-rate>
+          <span v-if="s.comments !== undefined && s.comments !== null">{{ s.comments }}条评价</span>
+          <span v-else>附近结果</span>
+        </div>
+        <div class="shop-area shop-item">
+          <span>{{ s.area || '附近' }}</span>
+          <span v-if="s.distance !== undefined && s.distance !== null">{{ formatDistance(s.distance) }}</span>
+        </div>
+        <div class="shop-avg shop-item">￥{{ s.avgPrice || '-' }}/人</div>
+        <div class="shop-address shop-item"><i class="el-icon-map-location"></i><span>{{ s.address }}</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="./js/vue.js"></script>
+<script src="./js/axios.min.js"></script>
+<script src="./js/element.js"></script>
+<script src="./js/location.js?v=20260614fix3"></script>
+<script src="./js/common.js?v=20260614fix3"></script>
+<script>
+  new Vue({
+    el: "#app",
+    data: {
+      isReachBottom: false,
+      loading: false,
+      types: [],
+      shops: [],
+      searchText: "",
+      typeName: "",
+      params: { typeId: 0, current: 1, sortBy: "", x: null, y: null }
+    },
+    created() {
+      this.params.typeId = util.getUrlParam("type");
+      this.typeName = util.getUrlParam("name");
+      this.searchText = util.getUrlParam("search");
+      var self = this;
+      UserLocation.init(function(loc) {
+        self.params.x = loc.lng;
+        self.params.y = loc.lat;
+        self.queryTypes();
+        self.queryShops();
+      }, false);
+    },
+    methods: {
+      queryTypes() {
+        axios.get("/shop-type/list")
+          .then((res) => { this.types = res.data || []; })
+          .catch(() => {});
+      },
+      queryShops() {
+        if (this.loading) return;
+        this.loading = true;
+        this.shops = [];
+
+        if (this.searchText) {
+          this.searchByName(this.searchText, true);
+          return;
+        }
+
+        try {
+          localStorage.setItem("last_map_type", this.params.typeId);
+          localStorage.setItem("last_map_name", this.typeName || "美食");
+        } catch (e) {}
+
+        if (this.shouldUseAmapOnly()) {
+          this.queryAmapPois().finally(() => { this.loading = false; });
+          return;
+        }
+
+        axios.get("/shop/of/type", { params: this.params })
+          .then((res) => {
+            let rows = this.applyLocalSort(res.data || []);
+            if (rows.length > 0) {
+              this.shops = rows;
+              return;
+            }
+            return this.queryAmapPois();
+          })
+          .catch((err) => { this.$message.error(err); })
+          .finally(() => { this.loading = false; });
+      },
+      shouldUseAmapOnly() {
+        var typeId = String(this.params.typeId);
+        var lat = Number(UserLocation.lat);
+        var lng = Number(UserLocation.lng);
+        var nearHangzhou = Math.abs(lat - 30.2741) < 0.6 && Math.abs(lng - 120.1551) < 0.8;
+        var localReliable = nearHangzhou && (typeId === "1" || typeId === "2");
+        return !localReliable;
+      },
+      queryAmapPois() {
+        return axios.get("/amap/around", {
+          params: {
+            lat: this.params.y,
+            lng: this.params.x,
+            keyword: this.toPoiKeyword(),
+            radiusKm: UserLocation.detected ? 10 : 50
+          }
+        }).then((res) => {
+          const pois = res.data || [];
+          this.shops = pois.map((p, index) => this.poiToShop(p, index));
+        }).catch((err) => {
+          this.$message.error(err);
+        });
+      },
+      toPoiKeyword() {
+        const map = {
+          "1": "food",
+          "2": "ktv",
+          "3": "hair",
+          "4": "fitness",
+          "5": "foot",
+          "6": "spa",
+          "7": "parent_child",
+          "8": "bar",
+          "9": "party",
+          "10": "nail"
+        };
+        return map[String(this.params.typeId)] || "food";
+      },
+      poiToShop(p, index) {
+        const loc = (p.location || "").split(",");
+        const lng = Number(loc[0]);
+        const lat = Number(loc[1]);
+        return {
+          id: "amap-" + (p.id || index),
+          name: p.name || "附近店铺",
+          images: "/imgs/blogs/blog1.jpg",
+          area: p.adname || p.cityname || "附近",
+          address: p.address || "",
+          avgPrice: null,
+          score: 45,
+          comments: null,
+          distance: p.distance ? Number(p.distance) / 1000 : null,
+          x: lng,
+          y: lat,
+          source: "高德POI"
+        };
+      },
+      searchByName(name, fromUrl) {
+        name = name || window.prompt("请输入要搜索的商户名");
+        if (!name || !name.trim()) return;
+        this.loading = true;
+        this.shops = [];
+        axios.get("/shop/of/name", { params: { name: name.trim(), current: 1 } })
+          .then((res) => {
+            const rows = res.data || [];
+            rows.forEach((s) => {
+              if (s.x && s.y && this.params.x && this.params.y) {
+                s.distance = this.haversine(this.params.y, this.params.x, s.y, s.x);
+              }
+            });
+            this.shops = this.applyLocalSort(rows);
+          })
+          .catch((err) => { this.$message.error(err); })
+          .finally(() => { this.loading = false; });
+        if (!fromUrl) {
+          this.searchText = name.trim();
+        }
+      },
+      applyLocalSort(rows) {
+        if (this.params.sortBy === "comments") {
+          return rows.sort((a, b) => (b.comments || 0) - (a.comments || 0));
+        }
+        if (this.params.sortBy === "score") {
+          return rows.sort((a, b) => (b.score || 0) - (a.score || 0));
+        }
+        return rows.sort((a, b) => (a.distance || 999999) - (b.distance || 999999));
+      },
+      handleCommand(t) {
+        location.href = "/shop-list.html?type=" + t.id + "&name=" + encodeURIComponent(t.name) + "&v=20260614fix3";
+      },
+      sortAndQuery(sortBy) {
+        this.params.sortBy = sortBy;
+        this.params.current = 1;
+        this.queryShops();
+      },
+      formatDistance(distance) {
+        const prefix = UserLocation.detected ? "距你" : "距城市中心";
+        const value = distance < 1 ? Math.round(distance * 1000) + "m" : distance.toFixed(1) + "km";
+        return prefix + value;
+      },
+      firstImage(images) {
+        return images ? images.split(",")[0] : "";
+      },
+      ratingValue(s) {
+        return s.score ? s.score / 10 : 4.5;
+      },
+      haversine(lat1, lng1, lat2, lng2) {
+        const R = 6371;
+        const dLat = (lat2 - lat1) * Math.PI / 180;
+        const dLng = (lng2 - lng1) * Math.PI / 180;
+        const a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+          + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180)
+          * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      },
+      goBack() {
+        history.back();
+      },
+      toDetail(shop) {
+        if ((shop.id + "").indexOf("amap-") === 0) return;
+        location.href = "/shop-detail.html?id=" + shop.id;
+      },
+      onScroll(e) {
+        if (this.shouldUseAmapOnly()) return;
+        var st = e.target.scrollTop, oh = e.target.offsetHeight, sh = e.target.scrollHeight;
+        if (st + oh + 1 > sh && !this.isReachBottom && !this.loading) {
+          this.isReachBottom = true;
+          this.params.current++;
+          this.queryShops();
+        } else {
+          this.isReachBottom = false;
+        }
+      }
+    }
+  });
+</script>
+</body>
+</html>

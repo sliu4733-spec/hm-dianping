@@ -11,6 +11,7 @@ import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.User;
 import com.hmdp.mapper.UserMapper;
 import com.hmdp.service.IUserService;
+import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RegexUtils;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
@@ -49,18 +50,22 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
     public Result sendCode(String phone, HttpSession session) {
         // 1.校验手机号
         if (RegexUtils.isPhoneInvalid(phone)) {
-            // 2.如果不符合，返回错误信息
             return Result.fail("手机号格式错误！");
         }
-        // 3.符合，生成验证码
-        String code = RandomUtil.randomNumbers(6);
 
-        // 4.保存验证码到 session
+        // 2. 【优化】增加防刷校验：同一手机号 1 分钟内只能发一次
+        String lockKey = RedisConstants.LOGIN_CODE_LOCK_KEY + phone;
+        Boolean isLock = stringRedisTemplate.opsForValue()
+                .setIfAbsent(lockKey, "1", RedisConstants.LOGIN_CODE_LOCK_TTL, TimeUnit.MINUTES);
+        if (isLock == null || !isLock) {
+            return Result.fail("发送太频繁，请稍后再试");
+        }
+
+        // 3.生成验证码
+        String code = RandomUtil.randomNumbers(6);
         stringRedisTemplate.opsForValue().set(LOGIN_CODE_KEY + phone, code, LOGIN_CODE_TTL, TimeUnit.MINUTES);
 
-        // 5.发送验证码
         log.debug("发送短信验证码成功，验证码：{}", code);
-        // 返回ok
         return Result.ok();
     }
 
@@ -69,10 +74,10 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // 1.校验手机号
         String phone = loginForm.getPhone();
         if (RegexUtils.isPhoneInvalid(phone)) {
-            // 2.如果不符合，返回错误信息
+            // 如果不符合，返回错误信息
             return Result.fail("手机号格式错误！");
         }
-        // 3.从redis获取验证码并校验
+        // 2.从redis获取验证码并校验
         String cacheCode = stringRedisTemplate.opsForValue().get(LOGIN_CODE_KEY + phone);
         String code = loginForm.getCode();
         if (cacheCode == null || !cacheCode.equals(code)) {
@@ -80,32 +85,72 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
             return Result.fail("验证码错误");
         }
 
-        // 4.一致，根据手机号查询用户 select * from tb_user where phone = ?
+        // 3.一致，根据手机号查询用户 select * from tb_user where phone = ?
         User user = query().eq("phone", phone).one();
 
-        // 5.判断用户是否存在
+        // 判断用户是否存在
         if (user == null) {
-            // 6.不存在，创建新用户并保存
+            // 不存在，创建新用户并保存
             user = createUserWithPhone(phone);
         }
+// 4.【核心改动】生成双 Token
+        // 4.1 生成 Access Token (短效) 和 Refresh Token (长效)
+        String accessToken = UUID.randomUUID().toString(true);
+        String refreshToken = UUID.randomUUID().toString(true);
 
-        // 7.保存用户信息到 redis中
-        // 7.1.随机生成token，作为登录令牌
-        String token = UUID.randomUUID().toString(true);
-        // 7.2.将User对象转为HashMap存储
+        // 4.2 保存 AT 到 Redis (Hash 结构，存储用户信息)
         UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
         Map<String, Object> userMap = BeanUtil.beanToMap(userDTO, new HashMap<>(),
                 CopyOptions.create()
                         .setIgnoreNullValue(true)
                         .setFieldValueEditor((fieldName, fieldValue) -> fieldValue.toString()));
-        // 7.3.存储
-        String tokenKey = LOGIN_USER_KEY + token;
-        stringRedisTemplate.opsForHash().putAll(tokenKey, userMap);
-        // 7.4.设置token有效期
-        stringRedisTemplate.expire(tokenKey, LOGIN_USER_TTL, TimeUnit.MINUTES);
 
-        // 8.返回token
-        return Result.ok(token);
+        // 使用新的 Key 常量：LOGIN_AT_KEY (建议定义为 "login:at:")
+        String atKey =  LOGIN_AT_KEY + accessToken;
+        stringRedisTemplate.opsForHash().putAll(atKey, userMap);
+        stringRedisTemplate.expire(atKey, LOGIN_AT_TTL, TimeUnit.MINUTES); // AT 设为 30 分钟
+
+        // 4.3 保存 RT 到 Redis (String 结构，仅存 userId 即可，节省空间)
+        // 使用新的 Key 常量：LOGIN_RT_KEY (建议定义为 "login:rt:")
+        String rtKey = LOGIN_RT_KEY  + refreshToken;
+        stringRedisTemplate.opsForValue().set(rtKey, user.getId().toString(), LOGIN_RT_TTL, TimeUnit.DAYS); // RT 设为 7 天
+
+        // 5. 返回双 Token
+        Map<String, String> tokenMap = new HashMap<>();
+        tokenMap.put("accessToken", accessToken);
+        tokenMap.put("refreshToken", refreshToken);
+
+        return Result.ok(tokenMap);
+
+    }
+    @Override
+    public Result refreshToken(String refreshToken) {
+        // 1. 在 Redis 中查找这个 RT
+        String rtKey = LOGIN_RT_KEY + refreshToken;
+        String userId = stringRedisTemplate.opsForValue().get(rtKey);
+
+        // 2. 校验 RT 是否过期
+        if (userId == null) {
+            return Result.fail("会话已过期，请重新登录");
+        }
+
+        // 3. RT 有效，生成一个新的 AT
+        String newAt = UUID.randomUUID().toString(true);
+
+        // 4. 获取用户信息（可以直接查数据库，或者从另一个独立的 UserCache 查）
+        User user = getById(userId);
+        UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
+        Map<String, Object> userMap = BeanUtil.beanToMap(userDTO, new HashMap<>(),
+                CopyOptions.create()
+                        .setIgnoreNullValue(true)
+                        .setFieldValueEditor((fieldName, fieldValue) -> fieldValue.toString()));
+
+        // 5. 将新 AT 存入 Redis
+        stringRedisTemplate.opsForHash().putAll(LOGIN_AT_KEY + newAt, userMap);
+        stringRedisTemplate.expire(LOGIN_AT_KEY + newAt, LOGIN_AT_TTL, TimeUnit.MINUTES);
+
+        // 6. 返回新的 AT
+        return Result.ok(newAt);
     }
 
     @Override
